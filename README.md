@@ -7,6 +7,7 @@ Unix world needs a CLI based CC monitoring tool that can accept various inputs. 
 Examples
 ========
 
+```
 $ CCmon 
 
 Default socket mode:
@@ -54,6 +55,11 @@ Fri Jan  6 13:10:06 2012: PID: 0x0, packets: 113
 Fri Jan  6 13:10:06 2012: PID: 0x1f69, packets: 574
 Fri Jan  6 13:10:06 2012: PID: 0x324, packets: 3110
 Fri Jan  6 13:10:06 2012: PID: 0x2c0, packets: 67483
+```
+
+Caveats
+=======
+This is a piece of horrible code but it does what it promises. Bugfixes and refactoring welcome :)
 
 
 License
