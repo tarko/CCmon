@@ -1,20 +1,20 @@
 #!/usr/bin/perl
 
-# tarko@lanparty.ee, 2009
+# tarko@lanparty.ee
 #
 # 26.10.09 - AFC only packet skipping added to CCmonitoring (ETV2 case)
 # 18.11.09 - support added for packets containing less than 7 MPEG packets
 # 16.12.09 - packet cache and CC monitoring improvements; bugfixes
-# 03.06.11 - direct mpeg-ts file support
+# 03.06.11 - direct mpeg-ts file support in ugly way
+# 06.01.12 - made vlan optional and proper option parsing
 #
 # TODO:
 # multigroup support
-# make vlan optional
-# command line options
-# documentation :)
-#
+# fix file mode syntax
+# refactor everything :)
 
 use POSIX;
+use Getopt::Long;
 use Net::Pcap;
 use IO::Socket::Multicast;
 use IO::Interface;
@@ -22,39 +22,52 @@ use IO::Select;
 use Data::Dumper;
 use strict;
 
-# --------------------------
+# default values
+# please do not edit, use command line parameters instead
 
-my $mode = "pcap";
-
+my $mode = "socket";
 my $port = "1234";
 my $dev = "mirror";
+my $vlan;
+my $group;
 
-my $debug = 0;
-my $pidscan = 1;
-my $ccmonit = 1;
 my $pidfilter = 0;
+my $debug = 0;
 my $stats = 0;
 my $cache = 0;
+my $pidscan = 1;
+my $ccmonit = 1;
+
+exit -1 unless GetOptions(
+	"mode=s" => sub {
+		my($name, $value) = @_;
+		$mode = $value if $value ~~ ["socket", "pcap", "file"];
+	},
+	"port=i" => \$port,
+	"dev=s" => \$dev,
+	"vlan=i" => \$vlan,
+	"group=s" => \$group,
+
+	"pidfilter=i" => \$pidfilter,
+	"debug" => \$debug,
+	"stats" => \$stats,
+	"cache" => \$cache,
+
+	"help|h" => \&help
+);
+
+&help unless($group);
+
+if($< != 0) {
+	print "Must run as root\n";
+	exit -1;
+}
+
+slog(sprintf "Starting with mode:%s dev:%s vlan:%s group:%s port:%s", $mode, $dev, $vlan, $group, $port);
 
 # --------------------------
 
 $| = 1;
-
-
-if($< != 0) {
-	print "Must run as root\n";
-	exit;
-}
-
-if(scalar @ARGV < 2) {
-	print "USAGE: CCmon <group-address> <vlan-number>\n";
-	exit;
-}
-
-my $group = $ARGV[0];
-my $vlan = $ARGV[1];
-
-# --------------------------
 
 my(%cc_cache, %pid_cache, %packet_cache);
 my $packetcounter = 0;
@@ -89,8 +102,12 @@ if($mode eq "socket") {
 elsif($mode eq "pcap") {
 	my ($err, $filter);
 
+	my $filterstring = "";
+	$filterstring .= "vlan $vlan and " if $vlan;
+	$filterstring .= "udp and host $group and port $port";
+
 	$pcap = Net::Pcap::open_live($dev, 1500, 0, 0, \$err);
-	Net::Pcap::compile($pcap, \$filter, "vlan $vlan and udp and host $group and port $port", 0, 0);
+	Net::Pcap::compile($pcap, \$filter, $filterstring, 0, 0);
 	Net::Pcap::setfilter($pcap, $filter);
 	Net::Pcap::loop($pcap, -1, \&pcap_process, 0);
 }
@@ -239,7 +256,7 @@ sub pcap_process {
 	my($payload);
 
 	# FIXME: this is very ugly hack
-	$payload = substr($packet, 46);
+	$payload = substr($packet, $vlan ? 46 : 42);
 	analyze($payload);
 }
 
@@ -257,4 +274,25 @@ sub errlog {
 	printf STDERR "%s: %s\n", $ts, $msg;
 }
 
+sub help {
+print "
+Default socket mode:
+  CCmon -group 239.3.1.1 -dev eth0
 
+Using pcap capture:
+  CCmon -group 239.3.1.1 -mode pcap -dev mirror
+
+Using pcap capture with vlan and different port number:
+  CCmon -group 239.3.1.1 -mode pcap -dev mirror -vlan 4 -port 666
+
+Reading from file:
+  CCmon -group myfilename -mode file
+
+Additional parameters:
+  -pidfilter X        Run only on specific PID, ignore others
+  -stats              Report every 100000 packets received
+  -cache              Cache last 5 packets for every PID, display on CC error
+  -debug              Display all packets processed
+";
+exit -1;
+}
