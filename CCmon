@@ -1,0 +1,260 @@
+#!/usr/bin/perl
+
+# tarko@lanparty.ee, 2009
+#
+# 26.10.09 - AFC only packet skipping added to CCmonitoring (ETV2 case)
+# 18.11.09 - support added for packets containing less than 7 MPEG packets
+# 16.12.09 - packet cache and CC monitoring improvements; bugfixes
+# 03.06.11 - direct mpeg-ts file support
+#
+# TODO:
+# multigroup support
+# make vlan optional
+# command line options
+# documentation :)
+#
+
+use POSIX;
+use Net::Pcap;
+use IO::Socket::Multicast;
+use IO::Interface;
+use IO::Select;
+use Data::Dumper;
+use strict;
+
+# --------------------------
+
+my $mode = "pcap";
+
+my $port = "1234";
+my $dev = "mirror";
+
+my $debug = 0;
+my $pidscan = 1;
+my $ccmonit = 1;
+my $pidfilter = 0;
+my $stats = 0;
+my $cache = 0;
+
+# --------------------------
+
+$| = 1;
+
+
+if($< != 0) {
+	print "Must run as root\n";
+	exit;
+}
+
+if(scalar @ARGV < 2) {
+	print "USAGE: CCmon <group-address> <vlan-number>\n";
+	exit;
+}
+
+my $group = $ARGV[0];
+my $vlan = $ARGV[1];
+
+# --------------------------
+
+my(%cc_cache, %pid_cache, %packet_cache);
+my $packetcounter = 0;
+my $totalpackets = 0;
+
+my $pcap;
+my $sockets = IO::Select->new();
+
+# --------------------------
+
+my $sigset = POSIX::SigSet->new(SIGINT);
+my $sigaction = POSIX::SigAction->new(\&cleanup, $sigset);
+sigaction(SIGINT, $sigaction);
+
+# --------------------------
+
+if($mode eq "socket") {
+	my ($packet, $ns);
+
+	$ns = IO::Socket::Multicast->new(LocalPort => $port, LocalAddr => $group, ReuseAddr => 1);
+	$ns->sockopt(SO_RCVBUF, 1048576);
+	$ns->mcast_add($group, $dev);
+	$sockets->add($ns);
+
+	while(my @ready = $sockets->can_read()) {
+		foreach my $s (@ready) {
+			$s->recv($packet, 1500);
+			analyze($packet);	
+		}
+	}
+}
+elsif($mode eq "pcap") {
+	my ($err, $filter);
+
+	$pcap = Net::Pcap::open_live($dev, 1500, 0, 0, \$err);
+	Net::Pcap::compile($pcap, \$filter, "vlan $vlan and udp and host $group and port $port", 0, 0);
+	Net::Pcap::setfilter($pcap, $filter);
+	Net::Pcap::loop($pcap, -1, \&pcap_process, 0);
+}
+elsif($mode eq "file") {
+	my ($packet, $readlen);
+
+	open(F, $group);
+	binmode(F);
+
+	until(eof(F)) {
+		$readlen = read(F, $packet, 188);
+		
+		if($readlen != 188) {
+			slog(sprintf "File read short, only read %d packets", $readlen);
+			next;
+		}
+		analyze($packet);
+	}
+
+	close(F);
+
+	cleanup();
+}
+
+# --------------------------
+
+sub cleanup {
+
+	print "\nexiting...\n";
+	sleep 1;
+
+	if($mode eq "socket") {
+		# TODO proper socket closing
+	}
+	elsif($mode eq "pcap") {
+		my %pcapstats;
+		Net::Pcap::stats($pcap, \%pcapstats);
+		slog(sprintf("PCAP: recv:%d, drop:%d, ifdrop:%d", $pcapstats{"ps_recv"}, $pcapstats{"ps_drop"}, $pcapstats{"ps_ifdrop"}));
+		Net::Pcap::close($pcap);
+	}
+	elsif($mode eq "file") {
+		# TODO
+	}
+
+	if($pidscan) {
+		foreach my $pid (sort { $pid_cache{$a} <=> $pid_cache{$b} } keys %pid_cache) {
+			slog(sprintf "PID: 0x%x, packets: %d", $pid, $pid_cache{$pid});
+		}
+	}
+	
+	if($stats) {
+		slog(sprintf "Total packets: %d", $totalpackets);
+	}
+
+	exit 0;
+
+}
+
+# --------------------------
+
+sub analyze {
+	my $udp_packet = shift;
+
+	my($ts_packet, $ts_head, $ts_data);
+	my($ts_syncb, $ts_tei, $ts_pusi, $ts_tp, $ts_pid, $ts_tsc, $ts_afc, $ts_cc);
+
+	if(length($udp_packet) % 188 != 0) {
+		errlog("packet_length % 188 not zero!");
+		exit -1;
+	}
+
+		for(my $i = 0; $i < length($udp_packet); $i+=188) {
+			
+			($ts_head, $ts_data) = unpack("Na*", substr($udp_packet, $i, 188));
+
+			$ts_syncb = ($ts_head & 0xFF000000) >> 24;
+			$ts_tei = ($ts_head & 0x00800000) >> 23;
+			$ts_pusi = ($ts_head & 0x00400000) >> 22;
+			$ts_tp = ($ts_head & 0x00200000) >> 21;
+			$ts_pid = ($ts_head & 0x001FFF00) >> 8;
+			$ts_tsc =  ($ts_head & 0x000000C0) >> 6;
+			$ts_afc = ($ts_head & 0x00000030) >> 4;
+			$ts_cc = ($ts_head & 0x0000000F) >> 0;
+			
+			if($ts_syncb != 0x47) {
+				errlog("lost sync!");
+				exit -1;
+			}
+
+			# PID FILTER			
+			if($pidfilter) {
+				if($ts_pid != $pidfilter) { next; }
+			}
+
+			# DEBUG MODE
+			if($debug) {
+				slog(sprintf "%08b %b %b %b %013b %02b %02b %04b", $ts_syncb, $ts_tei, $ts_pusi, $ts_tp, $ts_pid, $ts_tsc, $ts_afc, $ts_cc);
+			}
+
+			# cache last packets/PIDs for logging
+			if($cache) {
+				push(@{$packet_cache{$group}{$ts_pid}}, sprintf "%08b %b %b %b %013b %02b %02b %04b", $ts_syncb, $ts_tei, $ts_pusi, $ts_tp, $ts_pid, $ts_tsc, $ts_afc, $ts_cc);
+				if(scalar @{$packet_cache{$group}{$ts_pid}} > 5) { shift(@{$packet_cache{$group}{$ts_pid}}); }
+			}
+
+			# CC monitoring, skip AFC only packets
+			if($ccmonit) {
+				if($cc_cache{$group}{$ts_pid} && (($cc_cache{$group}{$ts_pid} + 1) % 16) != $ts_cc && $ts_afc != 0b10) {
+					slog(sprintf "CC error! PID: 0x%x Expected: %d, is %d", $ts_pid, (($cc_cache{$group}{$ts_pid} + 1) % 16), $ts_cc);
+
+					# print last packets from cache
+					if($cache) {
+						foreach (@{$packet_cache{$group}{$ts_pid}}) {
+							slog(sprintf("Previous packets for PID 0x%x: %s", $ts_pid, $_));
+						}
+					}
+				}
+
+				$cc_cache{$group}{$ts_pid} = $ts_cc;
+			}
+
+			# PIDSCAN
+			if($pidscan) {
+				if(!$pid_cache{$ts_pid}) {
+					slog(sprintf "Found PID: 0x%x", $ts_pid);
+				}
+				
+				$pid_cache{$ts_pid}++;
+			}
+
+			if($stats) {
+				$packetcounter++;
+				$totalpackets++;
+				if($packetcounter > 100000) {
+					slog("100000 packets received");
+					$packetcounter = 0;
+				}
+			}
+		}
+}
+
+# --------------------------
+
+sub pcap_process {
+	my($user_data, $header, $packet) = @_;
+	my($payload);
+
+	# FIXME: this is very ugly hack
+	$payload = substr($packet, 46);
+	analyze($payload);
+}
+
+# --------------------------
+
+sub slog {
+	my $msg = shift;
+	my $ts = localtime();
+	printf "%s: %s\n", $ts, $msg;
+}
+
+sub errlog {
+	my $msg = shift;
+	my $ts = localtime();
+	printf STDERR "%s: %s\n", $ts, $msg;
+}
+
+
